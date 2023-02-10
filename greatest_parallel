@@ -69,7 +69,8 @@ mkdir -p "${TMP}/SUITES";
 
 function my::teardown()
 {
-	trap "" EXIT QUIT TERM INT;
+	trap - INT TERM EXIT QUIT;
+	jobs -pr | xargs -r -L1 kill --;
 	wait;
 	rm -rf "${TMP}";
 	exit "$1";
