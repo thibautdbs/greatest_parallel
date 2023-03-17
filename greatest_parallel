@@ -1,133 +1,224 @@
 #!/usr/bin/env bash
 
-################################################################################
-### ARGPARSE
+function red() { printf "\e[91m%s\e[0m" "$@"; }
+function yellow() { printf "\e[33m%s\e[0m" "$@"; }
 
-function my::put_usage()
+function usage()
 {
-	echo "usage: greatest_parallel [-v|--verbose] [-j|--jobs JOBSMAX] TEST_RUNNER"
+	cat <<-EOF
+	$(yellow usage:) $0 [-v|--verbose] [-j|--jobs JOBSMAX] TEST_RUNNER
+	
+	    executes test suites from TEST_RUNNER in parallel.
+	    expect a TEST_RUNNER generated with greatest lib,
+	    (see https://github.com/silentbicycle/greatest).
+
+	    options:
+	        [-v|--verbose]: 
+	            always print tests logs.
+
+	        [-j|--jobs JOBSMAX]:
+	            run JOBSMAX suites concurently, defaults to nproc.
+	EOF
 }
 
-declare -a ARGS;
+function error()
+{
+	echo "$(red "$0: Error:")" "$@" >&2;
+	echo;
+}
+
+################################################################################
+### PARSING
+
+declare -a POSITIONAL_ARGS;
+
+### Options Parsing
 while [[ "$#" -gt 0 ]]; do
-	case "$1" in
-	-h)
-		my::put_usage;
+    case "$1" in
+    -h)
+	{
+		usage;
 		exit 0;
-		;;
-	-v|--verbose)
+	};;
+    -v|--verbose)
+	{
+		VERBOSE=1;
 		shift 1;
-		declare -r VERBOSE=1;
-		;;
-	-j|--jobs)
-		if [[ ! "$2" =~ ^[0-9]+$ ]]; then
-			echo "greatest_parallel: expected positive integer after -j|--jobs." >&2;
-			my::put_usage;
-			exit 1;
-		fi
+	};;
+    -j|--jobs)
+	{
 		JOBSMAX="$2";
+		[[ "${JOBSMAX}" =~ [0-9]+$ ]] || {
+			error "$1: ${JOBSMAX}: expected positive integer";
+			usage;
+			exit 1;
+		}
 		shift 2;
-		;;
-	-*)
-		echo "Unknown option $1." >&2;
-		my::put_usage;
+	};;
+    -*)
+	{
+		error "Unknown option \`$1'".;
+		usage;
 		exit 1;
-		;;
-	*)
-		ARGS+=("$1");
-		shift 1;
-		;;
-	esac
+	};;
+    *) POSITIONAL_ARGS+=("$1"); shift 1;;
+    esac
 done
-set -- "${ARGS[@]}";
-if [[ "$#" -ne 1 ]]; then
-	echo "greatest_parallel: Expected 1 positional arguments." >&2;
-	my::put_usage;
-	exit 1;
-fi
 
-if [[ -z "${JOBSMAX}" ]]; then
-	declare -r JOBSMAX=$(nproc);
-fi
+JOBSMAX="${JOBSMAX:-$(nproc)}"; #use nproc if option wasn't specified.
+JOBSMAX="${JOBSMAX:-1}";        #use 1 if call to nproc failed.
+readonly JOBSMAX;
 
-declare -r RUNNER=${1};
-if [[ ! -x "${RUNNER}" ]]; then
-	echo "greatest_parallel: ${RUNNER} is not executable." >&2;
+VERBOSE="${VERBOSE:-0}";        #default VERBOSE to false
+readonly VERBOSE;
+
+### Positional args parsing
+set -- "${POSITIONAL_ARGS[@]}";
+
+[[ "$#" -eq 1 ]] || {
+	error "Expected 1 positional argument.";
+    usage;
 	exit 1;
-fi
+}
+
+RUNNER="$(realpath -- "$1")";
+readonly RUNNER;
+
+[[ -f "${RUNNER}" ]] || {
+    error "$1: file doesn't exist.";
+    exit 1;
+}
+
+[[ -x "${RUNNER}" ]] || {
+	error "$1: Permission denied.";
+	exit 1;
+}
 
 ################################################################################
 ### MAIN
 
-### TMP FILES
-declare -r TMP=$(mktemp -d /tmp/greatest_parallel.XXXXXXXX);
-if [[ ! -d "${TMP}" ]]; then
-	echo "greatest_parallel: couldn't create tmp directory." >&2;
-	exit 1;
-fi
-mkdir -p "${TMP}/SUITES";
+### create tmp directory
 
-function my::teardown()
+TMP=$(mktemp -d /tmp/greatest_parallel.XXXXXXXX);
+readonly TMP;
+
+[[ -d "${TMP}" ]] || {
+	error "Couldn't create tmp directory.";
+	exit 1;
+}
+
+### clean on exit: delete TMP directory and kill process group
+function teardown()
 {
-	trap - INT TERM EXIT QUIT;
-	jobs -pr | xargs -r -L1 kill --;
+    local RET=$?;
+    readonly RET;
+
+    exec &>/dev/null;
+	trap "" INT TERM EXIT QUIT;
+    kill -TERM "-$$";
 	wait;
 	rm -rf "${TMP}";
-	exit "$1";
+    trap - EXIT;
+	exit "${RET}";
 }
-trap 'my::teardown $?' EXIT QUIT TERM INT;
+trap teardown EXIT QUIT TERM INT;
 
-declare -r SUITES=$(mktemp -p "${TMP}");
-declare -r FAILED_SUITES=$(mktemp -p "${TMP}");
 
-### TEST RUNNER
-function my::run_suite()
-{
-	declare -r SUITE="$1";
+### create logs
 
-	declare -r LOG="${TMP}/SUITES/${SUITE}";
+mkdir -p "${TMP}/logs";     # create subdirectory for logs
 
-	timeout --verbose --kill-after=5s 3s						\
-		valgrind --quiet --leak-check=full --show-reachable=yes	\
-			"${RUNNER}" -e -s "${SUITE}" >&"${LOG}";
+FAILURES="${TMP}/failures"; # create file to save which suites failed.
+readonly FAILURES;
 
-	if [[ "$?" != 0 ]]; then
-		flock "${FAILED_SUITES}" -c "echo '${SUITE}' >>'${FAILED_SUITES}'";
-	fi
-	flock "${SUITES}" -c "echo '${SUITE}' >>'${SUITES}'";
-}
 
-function my::log()
-{
-	sort -u | while read -r SUITE; do
+### PARALLEL TEST RUNNER
+
+function run()
+(
+    local SUITE CMD RET;
+
+	SUITE="$1";
+
+	CMD=(
+		timeout --verbose --kill-after=5s 3s
+		valgrind --quiet --leak-check=full --show-reachable=yes
+		"${RUNNER}"
+	);
+	[[ -n "${SUITE}" ]] && CMD+=( -e -s "${SUITE}" );
+	readonly CMD;
+
+	[[ -z "$SUITE" ]] && SUITE="default";
+	readonly SUITE;
+
+
+	### Redirect output toward logfile
+	{
+		# print header formatted like:
+		# ------------------------------------------------- SUITE: SUITENAME ---
+		readonly SUFFIX=" SUITE: ${SUITE} ---";
 		cat <<-EOF
-		================ SUITE: \`${SUITE}\`
-		$(cat "${TMP}/SUITES/${SUITE}")
+		$(printf -- "-%.s" $(seq $(( $(tput cols) - ${#SUFFIX} ))))${SUFFIX}
 
+		>>> ran cmd: ${CMD[@]}
 		EOF
-	done
-}
 
-function my::run_suites()
+		### run suite through timeout and valgrind.
+		"${CMD[@]}";
+
+		RET="$?";
+		readonly RET;
+
+		### write SUITE exit code at end of logfile.
+		cat <<-EOF
+		
+		>>> SUITE: \`${SUITE}' exited with code: ${RET}
+		EOF
+
+	} &>"${TMP}/logs/${SUITE}"; #logfile
+
+    ### record suite failed for later logging.
+	[[ "${RET}" -eq 0 ]] || {
+		flock "${FAILURES}" -c "echo '${SUITE}' >>'${FAILURES}'";
+    }
+)
+
+function run_suites()
 {
-	declare SUITE;
+    local SUITE;
+
 	while read -r SUITE; do
+        # run at most JOBSMAX suites in parallel.
 		if [[ "$(jobs | wc -l)" -ge "${JOBSMAX}" ]]; then
 			wait -n;
 		fi
-		my::run_suite "${SUITE}" >&/dev/null &
+		run "${SUITE}" &>/dev/null &
 	done
 	wait;
-
-	if [[ "${VERBOSE}" == 1 ]]; then
-		my::log <"${SUITES}";
-	elif [[ "$(wc -l <"${FAILED_SUITES}")" -gt 0 ]]; then
-		my::log <"${FAILED_SUITES}";
-	fi
-
-	if [[ "$(wc -l <"${FAILED_SUITES}")" -gt 0 ]]; then
-		exit 1;
-	fi
 }
 
-"${RUNNER}" -l | sed -nr 's|^\* Suite (.+):$|\1|p' | my::run_suites;
+
+### List suites from RUNNER, and run them in parallel if any
+NSUITES=$(										\
+	"${RUNNER}" -l								\
+		| sed -nr 's|^\* Suite (.+):$|\1|p'		\
+		| tee >(run_suites)						\
+		| wc -l									\
+)
+
+### if there are no test suites, execute RUNNER as-is
+if [[ "${NSUITES}" -eq 0 ]]; then
+	run;
+fi
+
+### show logs depending on verbosity and suites failures
+if [[ "${VERBOSE}" == 1 ]]; then
+	cat "${TMP}"/logs/*;
+
+elif [[ -s "${FAILURES}" ]]; then
+	<"${FAILURES}" sort -u | while read -r SUITE; do
+		cat "${TMP}/logs/${SUITE}";
+	done
+fi
+
+[[ -s "${FAILURES}" ]] || exit 1;
