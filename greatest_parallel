@@ -222,12 +222,12 @@ fi
 if [[ "${VERBOSE}" == 1 ]]; then
 	cat "${TMP}"/logs/*;
 
-elif [[ -s "${FAILURES}" ]]; then
+elif [[ -f "${FAILURES}" ]]; then
 	<"${FAILURES}" sort -u | while read -r SUITE; do
 		cat "${TMP}/logs/${SUITE}";
 	done
 fi
 
-[[ -s "${FAILURES}" ]] || {
+if [[ -f "${FAILURES}" ]]; then
 	exit 1;
-}
+fi
