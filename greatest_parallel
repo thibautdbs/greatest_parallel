@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+NAME="$(basename "$0")";
+NAME="${NAME:-greatest_parallel}";
+readonly NAME;
+
 function red() { printf "\e[91m%s\e[0m" "$@"; }
 function yellow() { printf "\e[33m%s\e[0m" "$@"; }
 
@@ -142,7 +146,10 @@ function run()
 
 	CMD=(
 		timeout --verbose --kill-after=5s 3s
-		valgrind --quiet --leak-check=full --show-reachable=yes
+		valgrind	--quiet
+					--error-exitcode=1
+					--leak-check=full
+					--show-reachable=yes
 		"${RUNNER}"
 	);
 	[[ -n "${SUITE}" ]] && CMD+=( -e -s "${SUITE}" );
@@ -221,4 +228,6 @@ elif [[ -s "${FAILURES}" ]]; then
 	done
 fi
 
-[[ -s "${FAILURES}" ]] || exit 1;
+[[ -s "${FAILURES}" ]] || {
+	exit 1;
+}
